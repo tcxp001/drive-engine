@@ -1,0 +1,192 @@
+package guangyapan
+
+import (
+	"encoding/json"
+	"time"
+)
+
+type tokenResp struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	Error        string `json:"error"`
+	ErrorCode    int    `json:"error_code"`
+	ErrorDesc    string `json:"error_description"`
+}
+
+type verificationResp struct {
+	VerificationID string `json:"verification_id"`
+	Error          string `json:"error"`
+	ErrorCode      int    `json:"error_code"`
+	ErrorDesc      string `json:"error_description"`
+}
+
+type captchaInitResp struct {
+	CaptchaToken string `json:"captcha_token"`
+	Error        string `json:"error"`
+	ErrorCode    int    `json:"error_code"`
+	ErrorDesc    string `json:"error_description"`
+}
+
+type verifyResp struct {
+	VerificationToken string `json:"verification_token"`
+	Error             string `json:"error"`
+	ErrorCode         int    `json:"error_code"`
+	ErrorDesc         string `json:"error_description"`
+}
+
+type userMeResp struct {
+	Sub string `json:"sub"`
+}
+
+type commonResp struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+}
+
+type listResp struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		Total int        `json:"total"`
+		List  []fileItem `json:"list"`
+	} `json:"data"`
+}
+
+type fileItem struct {
+	FileID   string `json:"fileId"`
+	ParentID string `json:"parentId"`
+	FileName string `json:"fileName"`
+	FileSize int64  `json:"fileSize"`
+	ResType  int    `json:"resType"`
+	CTime    int64  `json:"ctime"`
+	UTime    int64  `json:"utime"`
+}
+
+type downloadResp struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		SignedURL   string `json:"signedURL"`
+		DownloadURL string `json:"downloadUrl"`
+	} `json:"data"`
+}
+
+// fileDetailResp models /userres/v1/file/get_file_detail. Guangya has returned
+// MD5 both directly below data and below fileInfo across API revisions.
+type fileDetailResp struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		Md5      string `json:"md5"`
+		Etag     string `json:"etag"`
+		FileInfo struct {
+			Md5  string `json:"md5"`
+			Etag string `json:"etag"`
+			Hash string `json:"hash"`
+		} `json:"fileInfo"`
+	} `json:"data"`
+}
+
+type createDirResp struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		FileID string `json:"fileId"`
+	} `json:"data"`
+}
+
+type deleteResp struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		TaskID string `json:"taskId"`
+	} `json:"data"`
+}
+
+type taskStatusResp struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		Status int `json:"status"`
+	} `json:"data"`
+}
+
+type uploadTokenResp struct {
+	Code int             `json:"code"`
+	Msg  string          `json:"msg"`
+	Data uploadTokenData `json:"data"`
+}
+
+type uploadTokenData struct {
+	TaskID          string `json:"taskId"`
+	ObjectPath      string `json:"objectPath"`
+	Provider        any    `json:"provider"`
+	Region          string `json:"region"`
+	BucketName      string `json:"bucketName"`
+	EndPoint        string `json:"endPoint"`
+	FullEndPoint    string `json:"fullEndPoint"`
+	AccessKeyID     string `json:"accessKeyID"`
+	SecretAccessKey string `json:"secretAccessKey"`
+	SessionToken    string `json:"sessionToken"`
+	Creds           struct {
+		AccessKeyID     string `json:"accessKeyID"`
+		SecretAccessKey string `json:"secretAccessKey"`
+		SessionToken    string `json:"sessionToken"`
+	} `json:"creds"`
+}
+
+type taskInfoResp struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		FileID string `json:"fileId"`
+	} `json:"data"`
+}
+
+func unixOrZero(v int64) time.Time {
+	if v <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(v, 0)
+}
+
+// Cloud download
+
+type OfflineTask struct {
+	TaskID   string `json:"taskId"`
+	TaskName string `json:"taskName"`
+	Status   int    `json:"status"`
+	Progress int64  `json:"progress"`
+	FileSize int64  `json:"fileSize"`
+	URL      string `json:"url"`
+	FileID   string `json:"fileId"`
+	ParentID string `json:"parentId"`
+	CTime    int64  `json:"ctime"`
+}
+
+func (t *OfflineTask) GetID() string {
+	return t.TaskID
+}
+
+type cloudTaskListResp struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		Total int           `json:"total"`
+		List  []OfflineTask `json:"list"`
+	} `json:"data"`
+}
+
+type cloudResolveResp struct {
+	Code int             `json:"code"`
+	Msg  string          `json:"msg"`
+	Data json.RawMessage `json:"data"`
+}
+
+type cloudCreateTaskResp struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		TaskID string `json:"taskId"`
+	} `json:"data"`
+}

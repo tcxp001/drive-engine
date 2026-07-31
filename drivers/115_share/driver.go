@@ -1,0 +1,266 @@
+package _115_share
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	_115 "github.com/OpenListTeam/OpenList/v4/drivers/115"
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/setting"
+	log "github.com/sirupsen/logrus"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	driver115 "github.com/power721/115driver/pkg/driver"
+	"golang.org/x/time/rate"
+)
+
+type Pan115Share struct {
+	model.Storage
+	Addition
+	limiter *rate.Limiter
+}
+
+func (d *Pan115Share) accountCount() int {
+	if d.AccountStorageID > 0 {
+		return 1
+	}
+	return op.GetDriverCount("115 Cloud")
+}
+
+func (d *Pan115Share) accountDriver(index int) driver.Driver {
+	if d.AccountStorageID > 0 {
+		return op.GetDriverByStorageID("115 Cloud", d.AccountStorageID)
+	}
+	return op.Get115Driver(index)
+}
+
+func (d *Pan115Share) Config() driver.Config {
+	return config
+}
+
+func (d *Pan115Share) GetAddition() driver.Additional {
+	return &d.Addition
+}
+
+func (d *Pan115Share) Init(ctx context.Context) error {
+	//if d.LimitRate > 0 {
+	//	d.limiter = rate.NewLimiter(rate.Limit(d.LimitRate), 1)
+	//}
+
+	if conf.LazyLoad && !conf.StoragesLoaded {
+		return nil
+	}
+
+	return d.Validate()
+}
+
+func (d *Pan115Share) WaitLimit(ctx context.Context) error {
+	if d.limiter != nil {
+		return d.limiter.Wait(ctx)
+	}
+	return nil
+}
+
+func (d *Pan115Share) Drop(ctx context.Context) error {
+	return nil
+}
+
+func (d *Pan115Share) Validate() error {
+	pan115 := d.accountDriver(idx)
+	if pan115 == nil {
+		return errors.New("找不到115云盘帐号")
+	}
+	client := pan115.(*_115.Pan115).GetClient()
+	_, err := client.GetShareSnap(d.ShareCode, d.ReceiveCode, "0", driver115.QueryLimit(1))
+	return err
+}
+
+func (d *Pan115Share) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
+	storage := d.accountDriver(idx)
+	if storage == nil {
+		return []model.Obj{}, errors.New("找不到115云盘帐号")
+	}
+	pan115 := storage.(*_115.Pan115)
+	if err := pan115.WaitLimit(ctx); err != nil {
+		return nil, err
+	}
+	client := pan115.GetClient()
+
+	files := make([]driver115.ShareFile, 0)
+	fileResp, err := client.GetShareSnap(d.ShareCode, d.ReceiveCode, dir.GetID(), driver115.QueryLimit(int(pan115.PageSize)))
+	if err != nil {
+		return nil, err
+	}
+	files = append(files, fileResp.Data.List...)
+	total := fileResp.Data.Count
+	count := len(fileResp.Data.List)
+	for total > count {
+		fileResp, err := client.GetShareSnap(
+			d.ShareCode, d.ReceiveCode, dir.GetID(),
+			driver115.QueryLimit(int(pan115.PageSize)), driver115.QueryOffset(count),
+		)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, fileResp.Data.List...)
+		count += len(fileResp.Data.List)
+	}
+
+	return utils.SliceConvert(files, transFunc)
+}
+
+func (d *Pan115Share) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	count := d.accountCount()
+	var lastErr error
+	for i := 0; i < count; i++ {
+		link, err := d.link(ctx, file, args)
+		if err == nil {
+			return link, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (d *Pan115Share) Other(ctx context.Context, args model.OtherArgs) (interface{}, error) {
+	if args.Method != "video_preview" {
+		return nil, errs.NotSupport
+	}
+	count := d.accountCount()
+	var lastErr error
+	for i := 0; i < count; i++ {
+		storage := d.accountDriver(idx)
+		idx++
+		if storage == nil {
+			lastErr = errors.New("找不到115云盘帐号")
+			continue
+		}
+		pan115 := storage.(*_115.Pan115)
+		if err := pan115.WaitLimit(ctx); err != nil {
+			lastErr = err
+			continue
+		}
+		parts := strings.SplitN(args.Obj.GetID(), "-", 2)
+		fid := parts[0]
+		sha1 := ""
+		if len(parts) == 2 {
+			sha1 = parts[1]
+		}
+		downloadInfo, err := pan115.GetClient().DownloadByShareCode(
+			d.ShareCode,
+			d.ReceiveCode,
+			fid,
+		)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		go delayDelete115(pan115, sha1)
+		result := map[string]interface{}{
+			"raw_url": downloadInfo.URL.URL,
+			"header": http.Header{
+				"User-Agent": []string{conf.UA115Browser},
+			},
+			"video_url":       "",
+			"definition_list": map[string]string{},
+		}
+		rawURL, err := url.Parse(downloadInfo.URL.URL)
+		if err != nil || !strings.HasPrefix(
+			strings.ToLower(rawURL.Query().Get("d")),
+			"vip-",
+		) {
+			return result, nil
+		}
+		received, err := pan115.FindReceivedFile(sha1, args.Obj.GetName())
+		if err != nil || received.PickCode == "" {
+			return result, nil
+		}
+		preview, err := pan115.GetVideoPreviewInfo(received.PickCode)
+		if err != nil {
+			return result, nil
+		}
+		result["video_url"] = preview.VideoURL
+		result["definition_list"] = preview.DefinitionList
+		return result, nil
+	}
+	return nil, lastErr
+}
+
+func (d *Pan115Share) link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	storage := d.accountDriver(idx)
+	idx++
+	if storage == nil {
+		return nil, errors.New("找不到115云盘帐号")
+	}
+	pan115 := storage.(*_115.Pan115)
+	if err := pan115.WaitLimit(ctx); err != nil {
+		return nil, err
+	}
+	client := pan115.GetClient()
+	log.Infof("[%v] 获取115文件直链 %v %v %v", pan115.ID, file.GetName(), file.GetID(), file.GetSize())
+
+	parts := strings.Split(file.GetID(), "-")
+	fid := parts[0]
+	sha1 := parts[1]
+	downloadInfo, err := client.DownloadByShareCode(d.ShareCode, d.ReceiveCode, fid)
+	if err != nil {
+		return nil, err
+	}
+	go delayDelete115(pan115, sha1)
+	exp := 4 * time.Hour
+	header := http.Header{}
+	header.Set("User-Agent", conf.UA115Browser)
+	return &model.Link{
+		URL:         downloadInfo.URL.URL + fmt.Sprintf("#storageId=%d", pan115.ID),
+		Expiration:  &exp,
+		Header:      header,
+		Concurrency: pan115.Concurrency,
+		PartSize:    pan115.ChunkSize * utils.KB,
+	}, nil
+}
+
+func delayDelete115(pan115 *_115.Pan115, sha1 string) {
+	delayTime := setting.GetInt(conf.DeleteDelayTime, 900)
+	if delayTime == 0 {
+		return
+	}
+
+	log.Infof("[%v] Delete 115 temp file %v after %v seconds.", pan115.ID, sha1, delayTime)
+	time.Sleep(time.Duration(delayTime) * time.Second)
+	pan115.DeleteReceivedFile(sha1)
+}
+
+func (d *Pan115Share) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
+	return errs.NotSupport
+}
+
+func (d *Pan115Share) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
+	return errs.NotSupport
+}
+
+func (d *Pan115Share) Rename(ctx context.Context, srcObj model.Obj, newName string) error {
+	return errs.NotSupport
+}
+
+func (d *Pan115Share) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
+	return errs.NotSupport
+}
+
+func (d *Pan115Share) Remove(ctx context.Context, obj model.Obj) error {
+	return errs.NotSupport
+}
+
+func (d *Pan115Share) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
+	return errs.NotSupport
+}
+
+var _ driver.Driver = (*Pan115Share)(nil)

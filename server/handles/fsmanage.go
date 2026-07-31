@@ -1,0 +1,549 @@
+package handles
+
+import (
+	"fmt"
+	stdpath "path"
+	"strings"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/task"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+	"github.com/OpenListTeam/OpenList/v4/internal/fs"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/sign"
+	"github.com/OpenListTeam/OpenList/v4/pkg/generic"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	"github.com/OpenListTeam/OpenList/v4/server/common"
+	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
+)
+
+type MkdirOrLinkReq struct {
+	Path string `json:"path" form:"path"`
+	Raw  bool   `json:"raw" form:"raw"`
+}
+
+func FsMkdir(c *gin.Context) {
+	var req MkdirOrLinkReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	reqPath, err := user.JoinPath(req.Path)
+	if err != nil {
+		common.ErrorResp(c, err, 403)
+		return
+	}
+	parentPath := stdpath.Dir(reqPath)
+	parentMeta, err := op.GetNearestMeta(parentPath)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	if !user.CanWriteContent() && !common.CanWriteContentBypassUserPerms(parentMeta, parentPath) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	if !common.CanWrite(user, parentMeta, parentPath) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	if err := fs.MakeDir(c.Request.Context(), reqPath); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c)
+}
+
+type MoveCopyReq struct {
+	SrcDir       string   `json:"src_dir"`
+	DstDir       string   `json:"dst_dir"`
+	Names        []string `json:"names"`
+	Overwrite    bool     `json:"overwrite"`
+	SkipExisting bool     `json:"skip_existing"`
+	Merge        bool     `json:"merge"`
+}
+
+// FsMove performs batch move (individual item permission checks skipped for performance).
+func FsMove(c *gin.Context) {
+	var req MoveCopyReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if len(req.Names) == 0 {
+		common.ErrorStrResp(c, "Empty file names", 400)
+		return
+	}
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	if !user.CanMove() {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	srcDir, err := user.JoinPath(req.SrcDir)
+	if err != nil {
+		common.ErrorResp(c, err, 403)
+		return
+	}
+	srcMeta, err := op.GetNearestMeta(srcDir)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	if !common.CanWrite(user, srcMeta, srcDir) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	dstDir, err := user.JoinPath(req.DstDir)
+	if err != nil {
+		common.ErrorResp(c, err, 403)
+		return
+	}
+	dstMeta, err := op.GetNearestMeta(dstDir)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	if !common.CanWrite(user, dstMeta, dstDir) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+
+	if !strings.HasSuffix(srcDir, "/") {
+		srcDir += "/"
+	}
+	// ensure req.Names are not relative/traversal paths
+	safeNames := make([]string, 0, len(req.Names))
+	for _, name := range req.Names {
+		srcPath := stdpath.Join(srcDir, name)
+		if !strings.HasPrefix(srcPath+"/", srcDir) {
+			continue
+		}
+		base := stdpath.Base(srcPath)
+		if base == "." || base == "/" {
+			common.ErrorStrResp(c, fmt.Sprintf("invalid file name [%s]", name), 400)
+			return
+		}
+		safeNames = append(safeNames, name)
+	}
+	req.Names = safeNames
+
+	var validNames []string
+	if !req.Overwrite {
+		for _, name := range req.Names {
+			if res, _ := fs.Get(c.Request.Context(), stdpath.Join(dstDir, name), &fs.GetArgs{NoLog: true}); res != nil && !req.SkipExisting {
+				common.ErrorStrResp(c, fmt.Sprintf("file [%s] exists", name), 403)
+				return
+			} else if res == nil {
+				validNames = append(validNames, name)
+			}
+		}
+	} else {
+		validNames = req.Names
+	}
+
+	// Create all tasks immediately without any synchronous validation
+	// All validation will be done asynchronously in the background
+	var addedTasks []task.TaskExtensionInfo
+	for i, name := range validNames {
+		t, err := fs.Move(c.Request.Context(), stdpath.Join(srcDir, name), dstDir, len(validNames) > i+1)
+		if t != nil {
+			addedTasks = append(addedTasks, t)
+		}
+		if err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+	}
+
+	// Return immediately with task information
+	if len(addedTasks) > 0 {
+		common.SuccessResp(c, gin.H{
+			"message": fmt.Sprintf("Successfully created %d move task(s)", len(addedTasks)),
+			"tasks":   getTaskInfos(addedTasks),
+		})
+	} else {
+		common.SuccessResp(c, gin.H{
+			"message": "Move operations completed immediately",
+		})
+	}
+}
+
+// FsCopy performs batch copy (individual item permission checks skipped for performance).
+func FsCopy(c *gin.Context) {
+	var req MoveCopyReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if len(req.Names) == 0 {
+		common.ErrorStrResp(c, "Empty file names", 400)
+		return
+	}
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	if !user.CanCopy() {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	srcDir, err := user.JoinPath(req.SrcDir)
+	if err != nil {
+		common.ErrorResp(c, err, 403)
+		return
+	}
+	srcMeta, err := op.GetNearestMeta(srcDir)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	if !common.CanRead(user, srcMeta, srcDir) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	dstDir, err := user.JoinPath(req.DstDir)
+	if err != nil {
+		common.ErrorResp(c, err, 403)
+		return
+	}
+	dstMeta, err := op.GetNearestMeta(dstDir)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	if !common.CanWrite(user, dstMeta, dstDir) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+
+	if !strings.HasSuffix(srcDir, "/") {
+		srcDir += "/"
+	}
+	// ensure req.Names are not relative/traversal paths
+	safeNames := make([]string, 0, len(req.Names))
+	for _, name := range req.Names {
+		srcPath := stdpath.Join(srcDir, name)
+		if !strings.HasPrefix(srcPath+"/", srcDir) {
+			continue
+		}
+		base := stdpath.Base(srcPath)
+		if base == "." || base == "/" {
+			common.ErrorStrResp(c, fmt.Sprintf("invalid file name [%s]", name), 400)
+			return
+		}
+		safeNames = append(safeNames, name)
+	}
+	req.Names = safeNames
+
+	var validNames []string
+	if !req.Overwrite {
+		for _, name := range req.Names {
+			if res, _ := fs.Get(c.Request.Context(), stdpath.Join(dstDir, name), &fs.GetArgs{NoLog: true}); res != nil {
+				if !req.SkipExisting && !req.Merge {
+					common.ErrorStrResp(c, fmt.Sprintf("file [%s] exists", name), 403)
+					return
+				} else if req.Merge && res.IsDir() {
+					validNames = append(validNames, name)
+				}
+			} else {
+				validNames = append(validNames, name)
+			}
+		}
+	} else {
+		validNames = req.Names
+	}
+
+	// Create all tasks immediately without any synchronous validation
+	// All validation will be done asynchronously in the background
+	var addedTasks []task.TaskExtensionInfo
+	for i, name := range validNames {
+		var t task.TaskExtensionInfo
+		if req.Merge {
+			t, err = fs.Merge(c.Request.Context(), stdpath.Join(srcDir, name), dstDir, len(validNames) > i+1)
+		} else {
+			t, err = fs.Copy(c.Request.Context(), stdpath.Join(srcDir, name), dstDir, len(validNames) > i+1)
+		}
+		if t != nil {
+			addedTasks = append(addedTasks, t)
+		}
+		if err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+	}
+
+	// Return immediately with task information
+	if len(addedTasks) > 0 {
+		common.SuccessResp(c, gin.H{
+			"message": fmt.Sprintf("Successfully created %d copy task(s)", len(addedTasks)),
+			"tasks":   getTaskInfos(addedTasks),
+		})
+	} else {
+		common.SuccessResp(c, gin.H{
+			"message": "Copy operations completed immediately",
+		})
+	}
+}
+
+type RenameReq struct {
+	Path      string `json:"path"`
+	Name      string `json:"name"`
+	Overwrite bool   `json:"overwrite"`
+}
+
+func FsRename(c *gin.Context) {
+	var req RenameReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	if !user.CanRename() {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	reqPath, err := user.JoinPath(req.Path)
+	if err == nil {
+		err = checkRelativePath(req.Name)
+	}
+	if err != nil {
+		common.ErrorResp(c, err, 403)
+		return
+	}
+	parentPath := stdpath.Dir(reqPath)
+	parentMeta, err := op.GetNearestMeta(parentPath)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	if !common.CanWrite(user, parentMeta, parentPath) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	if !req.Overwrite {
+		dstPath := stdpath.Join(stdpath.Dir(reqPath), req.Name)
+		if dstPath != reqPath {
+			if res, _ := fs.Get(c.Request.Context(), dstPath, &fs.GetArgs{NoLog: true}); res != nil {
+				common.ErrorStrResp(c, fmt.Sprintf("file [%s] exists", req.Name), 403)
+				return
+			}
+		}
+	}
+	if err := fs.Rename(c.Request.Context(), reqPath, req.Name); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c)
+}
+
+func checkRelativePath(path string) error {
+	if strings.ContainsAny(path, "/\\") || path == "" || path == "." || path == ".." {
+		return errs.RelativePath
+	}
+	return nil
+}
+
+type RemoveReq struct {
+	Dir   string   `json:"dir"`
+	Names []string `json:"names"`
+}
+
+// FsRemove performs batch remove (individual item permission checks skipped for performance).
+func FsRemove(c *gin.Context) {
+	var req RemoveReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if len(req.Names) == 0 {
+		common.ErrorStrResp(c, "Empty file names", 400)
+		return
+	}
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	if !user.CanRemove() {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	reqDir, err := user.JoinPath(req.Dir)
+	if err != nil {
+		common.ErrorResp(c, err, 403)
+		return
+	}
+	meta, err := op.GetNearestMeta(reqDir)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	if !common.CanWrite(user, meta, reqDir) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	for _, name := range req.Names {
+		// Skip invalid item names (empty string, whitespace, ".", "/","\t\t","..") to prevent accidental removal of current directory
+		if strings.TrimSpace(utils.FixAndCleanPath(name)) == "/" {
+			utils.Log.Warnf("FsRemove: invalid item skipped: %s (parent directory: %s)\n", name, reqDir)
+			continue
+		}
+		fullPath := stdpath.Join(reqDir, name)
+		if !strings.HasPrefix(fullPath+"/", reqDir+"/") {
+			utils.Log.Warnf("FsRemove: path traversal attempt skipped: %s (dir: %s)\n", name, req.Dir)
+			continue
+		}
+		err := fs.Remove(c.Request.Context(), fullPath)
+		if err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+	}
+	//fs.ClearCache(req.Dir)
+	common.SuccessResp(c)
+}
+
+type RemoveEmptyDirectoryReq struct {
+	SrcDir string `json:"src_dir"`
+}
+
+// FsRemoveEmptyDirectory recursively removes empty directories (individual item permission checks skipped for performance).
+func FsRemoveEmptyDirectory(c *gin.Context) {
+	var req RemoveEmptyDirectoryReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	if !user.CanRemove() {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	srcDir, err := user.JoinPath(req.SrcDir)
+	if err != nil {
+		common.ErrorResp(c, err, 403)
+		return
+	}
+
+	meta, err := op.GetNearestMeta(srcDir)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	if !common.CanWrite(user, meta, srcDir) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	common.GinAppendValues(c, conf.MetaKey, meta)
+
+	rootFiles, err := fs.List(c.Request.Context(), srcDir, &fs.ListArgs{})
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+
+	// record the file path
+	filePathMap := make(map[model.Obj]string)
+	// record the parent file
+	fileParentMap := make(map[model.Obj]model.Obj)
+	// removing files
+	removingFiles := generic.NewQueue[model.Obj]()
+	// removed files
+	removedFiles := make(map[string]bool)
+	for _, file := range rootFiles {
+		if !file.IsDir() {
+			continue
+		}
+		removingFiles.Push(file)
+		filePathMap[file] = srcDir
+	}
+
+	for !removingFiles.IsEmpty() {
+
+		removingFile := removingFiles.Pop()
+		removingFilePath := fmt.Sprintf("%s/%s", filePathMap[removingFile], removingFile.GetName())
+
+		if removedFiles[removingFilePath] {
+			continue
+		}
+
+		subFiles, err := fs.List(c.Request.Context(), removingFilePath, &fs.ListArgs{Refresh: true})
+		if err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+
+		if len(subFiles) == 0 {
+			// remove empty directory
+			err = fs.Remove(c.Request.Context(), removingFilePath)
+			removedFiles[removingFilePath] = true
+			if err != nil {
+				common.ErrorResp(c, err, 500)
+				return
+			}
+			// recheck parent folder
+			parentFile, exist := fileParentMap[removingFile]
+			if exist {
+				removingFiles.Push(parentFile)
+			}
+
+		} else {
+			// recursive remove
+			for _, subFile := range subFiles {
+				if !subFile.IsDir() {
+					continue
+				}
+				removingFiles.Push(subFile)
+				filePathMap[subFile] = removingFilePath
+				fileParentMap[subFile] = removingFile
+			}
+		}
+
+	}
+
+	common.SuccessResp(c)
+}
+
+// Link return real link, just for proxy program, it may contain cookie, so just allowed for admin
+func Link(c *gin.Context) {
+	var req MkdirOrLinkReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	//user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	//rawPath := stdpath.Join(user.BasePath, req.Path)
+	// why need not join base_path? because it's always the full path
+	rawPath := req.Path
+	storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{})
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	if storage.Config().NoLinkURL && !req.Raw {
+		common.SuccessResp(c, model.Link{
+			URL: fmt.Sprintf("%s/p%s?d&sign=%s",
+				common.GetApiUrl(c),
+				utils.EncodePath(rawPath, true),
+				sign.Sign(rawPath)),
+		})
+		return
+	}
+	linkArgs := model.LinkArgs{
+		IP:       c.ClientIP(),
+		Header:   c.Request.Header,
+		Redirect: true,
+	}
+	if req.Raw {
+		linkArgs.Type = model.LinkTypeAnonymousRaw
+	}
+	link, _, err := fs.Link(c.Request.Context(), rawPath, linkArgs)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	defer link.Close()
+	if req.Raw && link.URL == "" {
+		common.ErrorResp(c, errors.New("raw link is unavailable"), 409)
+		return
+	}
+	common.SuccessResp(c, link)
+}

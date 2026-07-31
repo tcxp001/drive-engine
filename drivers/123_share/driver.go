@@ -1,0 +1,223 @@
+package _123Share
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
+
+	_123 "github.com/OpenListTeam/OpenList/v4/drivers/123"
+	"github.com/OpenListTeam/OpenList/v4/drivers/base"
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
+)
+
+type Pan123Share struct {
+	model.Storage
+	Addition
+	apiRateLimit sync.Map
+	ref          *_123.Pan123
+}
+
+var get123PanDriverCount = func() int {
+	return op.GetDriverCount("123Pan")
+}
+
+var next123PanDriver = func(index int) driver.Driver {
+	return op.GetFirstDriver("123Pan", index)
+}
+
+func (d *Pan123Share) accountCount() int {
+	if d.AccountStorageID > 0 {
+		return 1
+	}
+	return get123PanDriverCount()
+}
+
+func (d *Pan123Share) accountDriver(index int) driver.Driver {
+	if d.AccountStorageID > 0 {
+		return op.GetDriverByStorageID("123Pan", d.AccountStorageID)
+	}
+	return next123PanDriver(index)
+}
+
+// resolveAnonLink is replaceable in tests so unlimited-only behavior can be
+// verified without reaching a real 123 endpoint or the global storage registry.
+var resolveAnonLink = func(d *Pan123Share, file File, ip string) (*model.Link, error) {
+	return d.anonDownloadLink(file, ip)
+}
+
+func (d *Pan123Share) Config() driver.Config {
+	return config
+}
+
+func (d *Pan123Share) GetAddition() driver.Additional {
+	return &d.Addition
+}
+
+func (d *Pan123Share) Init(ctx context.Context) error {
+	if conf.LazyLoad && !conf.StoragesLoaded {
+		return nil
+	}
+	return d.Validate()
+}
+
+func (d *Pan123Share) InitReference(storage driver.Driver) error {
+	refStorage, ok := storage.(*_123.Pan123)
+	if ok {
+		d.ref = refStorage
+		return nil
+	}
+	return fmt.Errorf("ref: storage is not 123Pan")
+}
+
+func (d *Pan123Share) Drop(ctx context.Context) error {
+	d.ref = nil
+	return nil
+}
+
+func (d *Pan123Share) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
+	// TODO return the files list, required
+	files, err := d.getFiles(ctx, dir.GetID())
+	if err != nil {
+		return nil, err
+	}
+	return utils.SliceConvert(files, func(src File) (model.Obj, error) {
+		return src, nil
+	})
+}
+
+func (d *Pan123Share) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	// Media Vault's 123 unlimited provider is an anonymous share contract.
+	// It must not consume 123Pan cookies or a 123 Open token, and an anonymous
+	// failure is final for this playback attempt.
+	if d.UnlimitedOnly {
+		f, ok := file.(File)
+		if !ok {
+			return nil, fmt.Errorf("can't convert obj")
+		}
+		return resolveAnonLink(d, f, args.IP)
+	}
+
+	// Traditional playback is the independent cookie-backed provider. It must
+	// not try anonymous unlimited playback or treat 123 Open as a credential.
+	count := d.accountCount()
+	if count == 0 {
+		if d.ref != nil {
+			return d.linkWithAccount(ctx, file, args, d.ref)
+		}
+		return nil, errors.New("找不到123云盘帐号")
+	}
+	var lastErr error
+	for i := 0; i < count; i++ {
+		link, err := d.link(ctx, file, args)
+		if err == nil {
+			return link, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (d *Pan123Share) link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	storage := d.accountDriver(idx)
+	idx++
+	if storage == nil {
+		return nil, errors.New("找不到123云盘帐号")
+	}
+	pan123, ok := storage.(*_123.Pan123)
+	if !ok {
+		return nil, errors.New("123云盘帐号类型无效")
+	}
+	return d.linkWithAccount(ctx, file, args, pan123)
+}
+
+func (d *Pan123Share) linkWithAccount(
+	ctx context.Context,
+	file model.Obj,
+	args model.LinkArgs,
+	pan123 *_123.Pan123,
+) (*model.Link, error) {
+	log.Infof("[%v] 获取123文件直链 %v %v %v", pan123.ID, file.GetName(), file.GetID(), file.GetSize())
+	f, ok := file.(File)
+	if !ok {
+		return nil, fmt.Errorf("can't convert obj")
+	}
+	var headers map[string]string
+	if !utils.IsLocalIPAddr(args.IP) {
+		headers = map[string]string{
+			"X-Forwarded-For": args.IP,
+		}
+	}
+	data := base.Json{
+		"driveId":   "0",
+		"shareKey":  d.ShareKey,
+		"SharePwd":  d.SharePwd,
+		"etag":      f.Etag,
+		"fileId":    f.FileId,
+		"s3keyFlag": f.S3KeyFlag,
+		"FileName":  f.FileName,
+		"size":      f.Size,
+	}
+	resp, err := pan123.Request(DownloadInfo, http.MethodPost, func(req *resty.Request) {
+		req.SetBody(data).SetHeaders(headers)
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return unwrap123DownloadLink(utils.Json.Get(resp, "data", "DownloadURL").ToString())
+}
+
+func (d *Pan123Share) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
+	// TODO create folder, optional
+	return errs.NotSupport
+}
+
+func (d *Pan123Share) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
+	// TODO move obj, optional
+	return errs.NotSupport
+}
+
+func (d *Pan123Share) Rename(ctx context.Context, srcObj model.Obj, newName string) error {
+	// TODO rename obj, optional
+	return errs.NotSupport
+}
+
+func (d *Pan123Share) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
+	// TODO copy obj, optional
+	return errs.NotSupport
+}
+
+func (d *Pan123Share) Remove(ctx context.Context, obj model.Obj) error {
+	// TODO remove obj, optional
+	return errs.NotSupport
+}
+
+func (d *Pan123Share) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
+	// TODO upload file, optional
+	return errs.NotSupport
+}
+
+//func (d *Pan123Share) Other(ctx context.Context, args model.OtherArgs) (interface{}, error) {
+//	return nil, errs.NotSupport
+//}
+
+func (d *Pan123Share) APIRateLimit(ctx context.Context, api string) error {
+	value, _ := d.apiRateLimit.LoadOrStore(api,
+		rate.NewLimiter(rate.Every(700*time.Millisecond), 1))
+	limiter := value.(*rate.Limiter)
+
+	return limiter.Wait(ctx)
+}
+
+var _ driver.Driver = (*Pan123Share)(nil)

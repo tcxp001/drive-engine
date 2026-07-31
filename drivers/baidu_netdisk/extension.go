@@ -1,0 +1,189 @@
+package baidu_netdisk
+
+import (
+	"errors"
+	"net/http"
+	stdpath "path"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
+)
+
+var baiduPanBaseURL = "https://pan.baidu.com"
+
+func (d *BaiduNetdisk) createTempDir() error {
+	d.TempDirId = "/"
+
+	files, err := d.getFiles("/")
+	if err != nil {
+		return err
+	}
+
+	// 仅按完整名称识别临时目录，且不删除任何用户目录。
+	// 上游原实现会把根目录下所有以 TempDirName 为前缀的文件夹当作历史残留
+	// 异步删除，这会误伤用户自建的同前缀目录（如 media-vault-temp-backup）。
+	// MV 的百度播放走"原画(无限)"免转存直链，unlimited_only 模式下已禁用
+	// saveFile 转存兜底，不会产生带后缀的残留目录，无需自动清理。
+	for _, file := range files {
+		if file.ServerFilename == conf.TempDirName {
+			d.TempDirId = file.Path
+			break
+		}
+	}
+
+	if d.TempDirId == "/" {
+		path := stdpath.Join("/", conf.TempDirName)
+		err = d.createDirectory(path, true)
+		if err != nil {
+			log.Warnf("create temp dir failed: %v", err)
+		}
+
+		files, err := d.getFiles("/")
+		if err != nil {
+			return err
+		}
+
+		for _, file := range files {
+			if file.ServerFilename == conf.TempDirName {
+				d.TempDirId = file.Path
+				break
+			}
+		}
+	}
+
+	log.Infof("Baidu temp dir: %v", d.TempDirId)
+
+	d.cleanTempFile()
+	return nil
+}
+
+func (d *BaiduNetdisk) createDirectory(path string, isDir bool) error {
+	params := map[string]string{
+		"a":          "commit",
+		"bdstoken":   d.Token,
+		"app_id":     "250528",
+		"clienttype": "0",
+		"web":        "1",
+	}
+	form := map[string]string{
+		"path":       path,
+		"isdir":      "0",
+		"block_list": "[]",
+	}
+	if isDir {
+		form["isdir"] = "1"
+	}
+	_, err := d.request("https://pan.baidu.com/api/create", http.MethodPost, func(req *resty.Request) {
+		req.SetQueryParams(params)
+		req.SetHeader("Origin", baiduPanBaseURL)
+		req.SetHeader("Referer", baiduPanBaseURL+"/disk/main")
+		req.SetHeader("X-Requested-With", "XMLHttpRequest")
+		req.SetFormData(form)
+	}, nil)
+	return err
+}
+
+func (d *BaiduNetdisk) cleanTempFile() {
+	if d.TempDirId == "/" {
+		return
+	}
+
+	files, err := d.getFiles(d.TempDirId)
+	if err != nil {
+		return
+	}
+
+	for _, file := range files {
+		log.Infof("Delete Baidu temp file: %v %v", file.FsId, file.Path)
+		d.Delete(fileToObj(file))
+	}
+}
+
+func (d *BaiduNetdisk) Delete(obj model.Obj) {
+	params := map[string]string{
+		"async":    "2",
+		"onnest":   "fail",
+		"opera":    "delete",
+		"bdstoken": d.Token,
+	}
+	data := []string{obj.GetPath()}
+	marshal, _ := utils.Json.MarshalToString(data)
+	_, err := d.postForm2("/api/filemanager", params, map[string]string{
+		"filelist": marshal,
+	}, nil)
+	if err != nil {
+		log.Warnf("delete file failed: %v", err)
+	}
+}
+
+func (d *BaiduNetdisk) verifyCookie() error {
+	client := resty.New().
+		SetBaseURL(baiduPanBaseURL).
+		SetHeader("User-Agent", "netdisk").
+		SetHeader("Referer", "https://pan.baidu.com")
+
+	query := map[string]string{
+		"app_id":     "250528",
+		"method":     "query",
+		"clienttype": "0",
+		"web":        "1",
+		"dp-logid":   "",
+	}
+	respJson := struct {
+		ErrorCode int64  `json:"error_code"`
+		ErrorMsg  string `json:"error_msg"`
+		Info      struct {
+			Username string `json:"username"`
+			UK       int64  `json:"uk"`
+			State    int    `json:"loginstate"`
+			IsVip    int    `json:"is_vip"`
+			IsSVip   int    `json:"is_svip"`
+		} `json:"user_info"`
+	}{}
+
+	res, err := client.R().
+		SetQueryParams(query).
+		SetHeader("Cookie", d.Cookie).
+		SetResult(&respJson).
+		Post("/rest/2.0/membership/user/info")
+	if err != nil {
+		log.Warnf("cookie error: %v", err)
+		return err
+	}
+	if d.UK != respJson.Info.UK {
+		return errors.New("cookie and token mismatch")
+	}
+
+	loginStatusResp := struct {
+		LoginInfo struct {
+			BDSToken string `json:"bdstoken"`
+		} `json:"login_info"`
+	}{}
+	_, err = client.R().
+		SetQueryParams(map[string]string{
+			"clienttype": "1",
+			"web":        "1",
+			"channel":    "web",
+			"version":    "0",
+		}).
+		SetHeader("Origin", "https://pan.baidu.com").
+		SetHeader("Referer", "https://pan.baidu.com/").
+		SetHeader("Cookie", d.Cookie).
+		SetResult(&loginStatusResp).
+		Get("/api/loginStatus")
+	if err != nil {
+		log.Warnf("get bdstoken error: %v", err)
+		return err
+	}
+	if loginStatusResp.LoginInfo.BDSToken == "" {
+		return errors.New("empty bdstoken")
+	}
+	d.Token = loginStatusResp.LoginInfo.BDSToken
+
+	log.Debugf("user info: %v", res.String())
+	log.Infof("cookie user info: %v", respJson.Info)
+	return nil
+}
