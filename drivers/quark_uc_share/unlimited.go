@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,7 +44,10 @@ const (
 	ucUnlimitedStokenTTL    = 30 * time.Minute
 	ucUnlimitedMaxDirs      = 2000
 	ucUnlimitedMaxPages     = 100
+	ucUnlimitedMaxAPIBytes  = 4 << 20
 )
+
+var unlimitedAPIURLPattern = regexp.MustCompile(`https?://[^\s"'<>]+`)
 
 // quarkUCUnlimitedKeeper owns the shared unlimited lease lifecycle for both
 // QuarkShare and UCShare. UC is anonymous. Quark uses an account Cookie only
@@ -740,6 +744,99 @@ type ucUnlimitedDownloadResponse struct {
 	Data    json.RawMessage `json:"data"`
 }
 
+type ucUnlimitedAPIError struct {
+	provider   string
+	httpStatus int
+	apiStatus  int
+	apiCode    int
+	message    string
+}
+
+func (e *ucUnlimitedAPIError) Error() string {
+	details := make([]string, 0, 3)
+	if e.httpStatus > 0 {
+		details = append(details, "HTTP "+strconv.Itoa(e.httpStatus))
+	}
+	if e.apiStatus > 0 && e.apiStatus != e.httpStatus {
+		details = append(details, "status "+strconv.Itoa(e.apiStatus))
+	}
+	if e.apiCode != 0 {
+		details = append(details, "code "+strconv.Itoa(e.apiCode))
+	}
+	prefix := e.provider + " unlimited API rejected request"
+	if len(details) > 0 {
+		prefix += ": " + strings.Join(details, " ")
+	}
+	if e.message != "" {
+		prefix += ": " + e.message
+	}
+	return prefix
+}
+
+type ucUnlimitedAPIErrorEnvelope struct {
+	Status  int    `json:"status"`
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func safeUnlimitedAPIMessage(
+	params *ucUnlimitedResolveParams,
+	code int,
+	message string,
+) string {
+	switch code {
+	case 41011:
+		return "share expired"
+	case 41012:
+		return "share cancelled"
+	case 41031:
+		return "share access restricted"
+	}
+	safe := strings.Join(strings.Fields(message), " ")
+	if params != nil {
+		sensitiveValues := []string{
+			params.key.shareID,
+			params.key.fileID,
+			params.sharePwd,
+			params.fidToken,
+		}
+		if params.driver != nil {
+			sensitiveValues = append(sensitiveValues, params.driver.APICookie)
+		}
+		for _, sensitive := range sensitiveValues {
+			if sensitive != "" {
+				safe = strings.ReplaceAll(safe, sensitive, "<redacted>")
+			}
+		}
+	}
+	safe = unlimitedAPIURLPattern.ReplaceAllString(safe, "<url>")
+	if safe == "" {
+		return "request rejected"
+	}
+	runes := []rune(safe)
+	if len(runes) > 160 {
+		safe = string(runes[:160])
+	}
+	return safe
+}
+
+func newUCUnlimitedAPIError(
+	params *ucUnlimitedResolveParams,
+	provider unlimitedProvider,
+	httpStatus int,
+	apiStatus int,
+	apiCode int,
+	message string,
+) error {
+	return &ucUnlimitedAPIError{
+		provider:   provider.key,
+		httpStatus: httpStatus,
+		apiStatus:  apiStatus,
+		apiCode:    apiCode,
+		message:    safeUnlimitedAPIMessage(params, apiCode, message),
+	}
+}
+
 type ucUnlimitedFileMeta struct {
 	FID             string `json:"fid"`
 	FileID          string `json:"file_id"`
@@ -1058,10 +1155,41 @@ func (k *ucUnlimitedLeaseKeeper) apiJSON(
 	defer response.Body.Close()
 	k.captureLeaseCookie(params.key.storageID, response)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("%s unlimited API returned HTTP %d",
-			params.provider.key, response.StatusCode)
+		payload, readErr := io.ReadAll(io.LimitReader(
+			response.Body,
+			ucUnlimitedMaxAPIBytes+1,
+		))
+		if readErr != nil || len(payload) > ucUnlimitedMaxAPIBytes {
+			return newUCUnlimitedAPIError(
+				&params,
+				params.provider,
+				response.StatusCode,
+				0,
+				0,
+				"request rejected",
+			)
+		}
+		var envelope ucUnlimitedAPIErrorEnvelope
+		if err := json.Unmarshal(payload, &envelope); err != nil {
+			return newUCUnlimitedAPIError(
+				&params,
+				params.provider,
+				response.StatusCode,
+				0,
+				0,
+				"request rejected",
+			)
+		}
+		return newUCUnlimitedAPIError(
+			&params,
+			params.provider,
+			response.StatusCode,
+			envelope.Status,
+			envelope.Code,
+			envelope.Message,
+		)
 	}
-	decoder := json.NewDecoder(io.LimitReader(response.Body, 4<<20))
+	decoder := json.NewDecoder(io.LimitReader(response.Body, ucUnlimitedMaxAPIBytes))
 	if err := decoder.Decode(result); err != nil {
 		return fmt.Errorf("%s unlimited API response is invalid", params.provider.key)
 	}
@@ -1110,10 +1238,7 @@ func validateUnlimitedAPIResponse(
 	message string,
 ) error {
 	if status >= 400 || code != 0 {
-		if message == "" {
-			message = "request rejected"
-		}
-		return fmt.Errorf("%s unlimited API rejected request: %s", provider.key, message)
+		return newUCUnlimitedAPIError(nil, provider, 0, status, code, message)
 	}
 	return nil
 }
@@ -1483,6 +1608,31 @@ func shortSensitiveDigest(value string) string {
 func classifyUCUnlimitedError(err error) string {
 	if err == nil {
 		return "unknown"
+	}
+	var apiErr *ucUnlimitedAPIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.apiCode {
+		case 41011:
+			return "api_code_41011_share_expired"
+		case 41012:
+			return "api_code_41012_share_cancelled"
+		case 41031:
+			return "api_code_41031_share_restricted"
+		}
+		switch {
+		case apiErr.httpStatus == http.StatusUnauthorized:
+			return "api_http_401"
+		case apiErr.httpStatus == http.StatusForbidden:
+			return "api_http_403"
+		case apiErr.httpStatus == http.StatusNotFound:
+			return "api_http_404"
+		case apiErr.httpStatus == http.StatusTooManyRequests:
+			return "api_http_429"
+		case apiErr.httpStatus >= 500:
+			return "api_http_5xx"
+		default:
+			return "upstream_rejected"
+		}
 	}
 	message := err.Error()
 	switch {

@@ -258,6 +258,94 @@ func TestQuarkUnlimitedProviderUsesPCShareAPI(t *testing.T) {
 	}
 }
 
+func TestQuarkUnlimitedAPIErrorPreservesSafeBusinessCode(t *testing.T) {
+	const (
+		shareID = "share-secret-value"
+		fileID  = "file-secret-value"
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		writeUCJSON(w, map[string]any{
+			"status":  404,
+			"code":    41012,
+			"message": "好友已取消了分享 " + shareID + " " + fileID + " " + r.Host,
+		})
+	}))
+	t.Cleanup(server.Close)
+
+	driver := quarkUnlimitedTestDriver(3, shareID)
+	provider, err := unlimitedProviderFor(driver)
+	if err != nil {
+		t.Fatalf("provider: %v", err)
+	}
+	keeper := newUCUnlimitedLeaseKeeper(server.Client(), server.URL)
+	params := ucUnlimitedResolveParams{
+		key: ucUnlimitedLeaseKey{
+			storageID: 3,
+			shareID:   shareID,
+			fileID:    fileID,
+		},
+		driver:   driver,
+		provider: provider,
+		sharePwd: "share-password",
+		fidToken: "fid-token-secret",
+	}
+	var result map[string]any
+	err = keeper.apiJSON(
+		context.Background(),
+		params,
+		http.MethodPost,
+		"/share/sharepage/token",
+		nil,
+		map[string]any{"pwd_id": shareID},
+		&result,
+	)
+	if err == nil {
+		t.Fatal("non-2xx Quark API response was accepted")
+	}
+	message := err.Error()
+	for _, expected := range []string{"HTTP 404", "code 41012", "share cancelled"} {
+		if !strings.Contains(message, expected) {
+			t.Fatalf("business error lost %q: %v", expected, err)
+		}
+	}
+	for _, secret := range []string{
+		shareID,
+		fileID,
+		"share-password",
+		"fid-token-secret",
+		"mv-quark-account-secret",
+		server.URL,
+	} {
+		if strings.Contains(message, secret) {
+			t.Fatalf("business error exposed sensitive value %q: %v", secret, err)
+		}
+	}
+	if got := classifyUCUnlimitedError(err); got != "api_code_41012_share_cancelled" {
+		t.Fatalf("unexpected error classification %q", got)
+	}
+}
+
+func TestUnlimitedAPIBusinessCodesHaveStableClassification(t *testing.T) {
+	provider := unlimitedProvider{key: "quark"}
+	tests := []struct {
+		code   int
+		reason string
+	}{
+		{code: 41011, reason: "api_code_41011_share_expired"},
+		{code: 41012, reason: "api_code_41012_share_cancelled"},
+		{code: 41031, reason: "api_code_41031_share_restricted"},
+	}
+	for _, test := range tests {
+		t.Run(strconv.Itoa(test.code), func(t *testing.T) {
+			err := validateUnlimitedAPIResponse(provider, 400, test.code, "unsafe detail")
+			if got := classifyUCUnlimitedError(err); got != test.reason {
+				t.Fatalf("unexpected error classification %q", got)
+			}
+		})
+	}
+}
+
 func TestQuarkUnlimitedResolveUsesAPICookieAndLeaseOnlyCDNRange(t *testing.T) {
 	mock := newUCUnlimitedMock(t)
 	installUCUnlimitedTestKeeper(t, mock)
