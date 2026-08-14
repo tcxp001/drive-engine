@@ -3,6 +3,8 @@ package guangyapan_share
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -47,14 +49,19 @@ func TestNormalizeShareID(t *testing.T) {
 	}
 }
 
-func TestGuangYaPanShareLink_CachesByShareIDAndFileID(t *testing.T) {
+func TestGuangYaPanShareLink_CachesByShareFileAndAccount(t *testing.T) {
 	origCache := guangYaPanShareLinkCache
 	origResolver := resolveGuangYaPanShareLink
 	guangYaPanShareLinkCache = cache.NewKeyedCache[*model.Link](time.Hour)
 	resolveCalls := 0
 	resolveGuangYaPanShareLink = func(ctx context.Context, d *GuangYaPanShare, file model.Obj, args model.LinkArgs) (*model.Link, error) {
 		resolveCalls++
-		return &model.Link{URL: "https://example.com/" + d.ShareID + "/" + file.GetID()}, nil
+		return &model.Link{URL: fmt.Sprintf(
+			"https://example.com/%s/%s/%d",
+			d.ShareID,
+			file.GetID(),
+			d.AccountStorageID,
+		)}, nil
 	}
 	t.Cleanup(func() {
 		guangYaPanShareLinkCache = origCache
@@ -62,8 +69,9 @@ func TestGuangYaPanShareLink_CachesByShareIDAndFileID(t *testing.T) {
 	})
 
 	file := &model.Object{ID: "file-1", Name: "video.mkv"}
-	firstDriver := &GuangYaPanShare{Addition: Addition{ShareID: "share-a"}}
-	secondDriver := &GuangYaPanShare{Addition: Addition{ShareID: "share-b"}}
+	firstDriver := &GuangYaPanShare{Addition: Addition{ShareID: "share-a", AccountStorageID: 11}}
+	secondAccountDriver := &GuangYaPanShare{Addition: Addition{ShareID: "share-a", AccountStorageID: 12}}
+	secondDriver := &GuangYaPanShare{Addition: Addition{ShareID: "share-b", AccountStorageID: 11}}
 
 	first, err := firstDriver.Link(context.Background(), file, model.LinkArgs{})
 	if err != nil {
@@ -73,19 +81,48 @@ func TestGuangYaPanShareLink_CachesByShareIDAndFileID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second link error: %v", err)
 	}
-	third, err := secondDriver.Link(context.Background(), file, model.LinkArgs{})
+	third, err := secondAccountDriver.Link(context.Background(), file, model.LinkArgs{})
 	if err != nil {
 		t.Fatalf("third link error: %v", err)
+	}
+	fourth, err := secondDriver.Link(context.Background(), file, model.LinkArgs{})
+	if err != nil {
+		t.Fatalf("fourth link error: %v", err)
 	}
 
 	if first.URL != second.URL {
 		t.Fatalf("expected cached result for identical share/file, got %q and %q", first.URL, second.URL)
 	}
 	if first.URL == third.URL {
+		t.Fatalf("expected different accounts to use different cache buckets, got %q", first.URL)
+	}
+	if first.URL == fourth.URL {
 		t.Fatalf("expected different shares to use different cache buckets, got %q", first.URL)
 	}
-	if resolveCalls != 2 {
-		t.Fatalf("expected resolver twice, got %d", resolveCalls)
+	if resolveCalls != 3 {
+		t.Fatalf("expected resolver three times, got %d", resolveCalls)
+	}
+}
+
+func TestPlaybackFileCacheKey_IsolatedBySessionAndAccount(t *testing.T) {
+	first := playbackFileCacheKey("session-a", 11)
+	secondAccount := playbackFileCacheKey("session-a", 12)
+	secondSession := playbackFileCacheKey("session-b", 11)
+
+	if first == "" {
+		t.Fatal("expected non-empty playback cache key")
+	}
+	if first == secondAccount {
+		t.Fatalf("different accounts must not share playback cache key: %q", first)
+	}
+	if first == secondSession {
+		t.Fatalf("different sessions must not share playback cache key: %q", first)
+	}
+	if playbackFileCacheKey("", 11) != "" {
+		t.Fatal("empty session must disable playback cache")
+	}
+	if playbackFileCacheKey("session-a", 0) != "" {
+		t.Fatal("missing pinned account storage must disable playback cache")
 	}
 }
 
@@ -155,5 +192,23 @@ func TestFileToObj(t *testing.T) {
 	}
 	if obj.Thumbnail.Thumbnail != "https://example.com/thumb.jpg" {
 		t.Fatalf("unexpected thumbnail: %q", obj.Thumbnail.Thumbnail)
+	}
+}
+
+func TestRestoreShareBodyCarriesClientID(t *testing.T) {
+	got := restoreShareBody(
+		" share-token ",
+		" file-1 ",
+		" parent-1 ",
+		" client-1 ",
+	)
+	want := map[string]any{
+		"accessToken": "share-token",
+		"fileIds":     []string{"file-1"},
+		"parentId":    "parent-1",
+		"clientId":    "client-1",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("restoreShareBody() = %#v, want %#v", got, want)
 	}
 }

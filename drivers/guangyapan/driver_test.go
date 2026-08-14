@@ -1,6 +1,7 @@
 package guangyapan
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
@@ -87,5 +88,16 @@ func TestUnixOrZero(t *testing.T) {
 	want := time.Unix(1710000000, 0)
 	if !got.Equal(want) {
 		t.Fatalf("unixOrZero() = %v, want %v", got, want)
+	}
+}
+
+func TestDeleteFileBodyCarriesClientID(t *testing.T) {
+	got := deleteFileBody(" file-1 ", " client-1 ")
+	want := map[string]any{
+		"fileIds":  []string{"file-1"},
+		"clientId": "client-1",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("deleteFileBody() = %#v, want %#v", got, want)
 	}
 }

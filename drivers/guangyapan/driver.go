@@ -309,9 +309,12 @@ func (d *GuangYaPan) Remove(ctx context.Context, obj model.Obj) error {
 	}
 
 	var del deleteResp
-	if err := d.postAPI(ctx, "/userres/v1/file/delete_file", map[string]any{
-		"fileIds": []string{fileID},
-	}, &del); err != nil {
+	if err := d.postAPI(
+		ctx,
+		"/userres/v1/file/delete_file",
+		deleteFileBody(fileID, d.ClientID),
+		&del,
+	); err != nil {
 		return err
 	}
 	if !strings.EqualFold(strings.TrimSpace(del.Msg), "success") {
@@ -322,6 +325,13 @@ func (d *GuangYaPan) Remove(ctx context.Context, obj model.Obj) error {
 		return nil
 	}
 	return d.waitTaskDone(ctx, taskID)
+}
+
+func deleteFileBody(fileID, clientID string) map[string]any {
+	return map[string]any{
+		"fileIds":  []string{strings.TrimSpace(fileID)},
+		"clientId": strings.TrimSpace(clientID),
+	}
 }
 
 func (d *GuangYaPan) Move(ctx context.Context, srcObj, dstDir model.Obj) error {

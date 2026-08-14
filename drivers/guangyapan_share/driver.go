@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
+	"github.com/OpenListTeam/OpenList/v4/pkg/singleflight"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
 )
@@ -28,6 +30,8 @@ const guangYaPanAPIBaseURL = "https://api.guangyapan.com"
 
 var (
 	guangYaPanShareLinkCache = cache.NewKeyedCache[*model.Link](time.Hour)
+	guangYaPanPlaybackFiles  = cache.NewKeyedCache[preparedPlaybackFile](24 * time.Hour)
+	guangYaPanPlaybackGroup  singleflight.Group[preparedPlaybackFile]
 	guangYaPanShareIDRegexp  = regexp.MustCompile(`^[A-Za-z0-9]+_[A-Za-z0-9_-]+$`)
 	guangYaPanShareURLRegexp = regexp.MustCompile(`https?://(?:www\.)?guangyapan\.com/s/([A-Za-z0-9_-]+)`)
 	guangYaPanAccountIdx     = 0
@@ -51,6 +55,12 @@ type GuangYaPanShare struct {
 	Addition
 
 	client *resty.Client
+}
+
+type preparedPlaybackFile struct {
+	FileID string
+	Name   string
+	Size   int64
 }
 
 func (d *GuangYaPanShare) accountCount() int {
@@ -184,7 +194,7 @@ func (d *GuangYaPanShare) Link(ctx context.Context, file model.Obj, args model.L
 	if file.IsDir() {
 		return nil, errs.NotFile
 	}
-	key := shareLinkCacheKey(d.ShareID, file.GetID())
+	key := shareLinkCacheKey(d.ShareID, file.GetID(), d.AccountStorageID)
 	log.Debugf("GuangYaPanShare share: %v %v", d.ShareID, file.GetID())
 	if link, ok := guangYaPanShareLinkCache.Get(key); ok {
 		return link, nil
@@ -204,9 +214,21 @@ func (d *GuangYaPanShare) Link(ctx context.Context, file model.Obj, args model.L
 // The share object must first be restored into the selected Guangya account;
 // get_file_detail on that restored object is the authoritative MD5 source.
 func (d *GuangYaPanShare) Other(ctx context.Context, args model.OtherArgs) (interface{}, error) {
-	if args.Method != "rapid_transfer_metadata" {
+	switch args.Method {
+	case "rapid_transfer_metadata":
+		return d.rapidTransferMetadata(ctx, args)
+	case "prepare_playback":
+		return d.preparePlayback(ctx, args)
+	case "refresh_playback":
+		return d.refreshPlayback(ctx, args)
+	case "cleanup_playback":
+		return d.cleanupPlayback(ctx, args)
+	default:
 		return nil, errs.NotSupport
 	}
+}
+
+func (d *GuangYaPanShare) rapidTransferMetadata(ctx context.Context, args model.OtherArgs) (interface{}, error) {
 	if args.Obj == nil || args.Obj.IsDir() {
 		return nil, errs.NotFile
 	}
@@ -241,6 +263,134 @@ func (d *GuangYaPanShare) Other(ctx context.Context, args model.OtherArgs) (inte
 		"size": restored.GetSize(),
 		"md5":  md5,
 	}, nil
+}
+
+func (d *GuangYaPanShare) preparePlayback(ctx context.Context, args model.OtherArgs) (interface{}, error) {
+	if args.Obj == nil || args.Obj.IsDir() {
+		return nil, errs.NotFile
+	}
+	data := otherData(args.Data)
+	sessionKey := strings.TrimSpace(stringValue(data["session_key"]))
+	cacheKey := playbackFileCacheKey(sessionKey, d.AccountStorageID)
+	account, err := d.account(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	var saved preparedPlaybackFile
+	if cacheKey != "" {
+		saved, err, _ = guangYaPanPlaybackGroup.Do(
+			cacheKey,
+			func() (preparedPlaybackFile, error) {
+				if cached, ok := guangYaPanPlaybackFiles.Get(cacheKey); ok && cached.FileID != "" {
+					return cached, nil
+				}
+				prepared, prepareErr := d.preparePlaybackFile(ctx, account, args.Obj)
+				if prepareErr != nil {
+					return preparedPlaybackFile{}, prepareErr
+				}
+				guangYaPanPlaybackFiles.Set(cacheKey, prepared)
+				return prepared, nil
+			},
+		)
+	} else {
+		saved, err = d.preparePlaybackFile(ctx, account, args.Obj)
+	}
+	if err != nil {
+		return nil, err
+	}
+	file := &model.Object{
+		ID:   saved.FileID,
+		Name: saved.Name,
+		Size: saved.Size,
+	}
+	link, err := account.Link(ctx, file, model.LinkArgs{})
+	if err != nil {
+		if cacheKey != "" {
+			guangYaPanPlaybackFiles.Delete(cacheKey)
+		}
+		return nil, err
+	}
+	return playbackLeaseResult(file, link), nil
+}
+
+func (d *GuangYaPanShare) preparePlaybackFile(
+	ctx context.Context,
+	account *guangyapan.GuangYaPan,
+	source model.Obj,
+) (preparedPlaybackFile, error) {
+	if d.ShareAccessToken == "" {
+		if err := d.getShareAccessToken(ctx); err != nil {
+			return preparedPlaybackFile{}, err
+		}
+	}
+	taskID, err := d.restoreShare(ctx, account, source.GetID())
+	if err != nil {
+		return preparedPlaybackFile{}, err
+	}
+	if err := d.waitTaskDone(ctx, account, taskID); err != nil {
+		return preparedPlaybackFile{}, err
+	}
+	restored, err := d.resolveRestoredFile(ctx, account, taskID, source)
+	if err != nil {
+		return preparedPlaybackFile{}, err
+	}
+	go d.delete(context.Background(), restored, account)
+	return preparedPlaybackFile{
+		FileID: restored.GetID(),
+		Name:   restored.GetName(),
+		Size:   restored.GetSize(),
+	}, nil
+}
+
+func (d *GuangYaPanShare) refreshPlayback(ctx context.Context, args model.OtherArgs) (interface{}, error) {
+	data := otherData(args.Data)
+	fileID := strings.TrimSpace(stringValue(data["file_id"]))
+	if fileID == "" {
+		return nil, errors.New("refresh playback requires file_id")
+	}
+	account, err := d.account(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := &model.Object{
+		ID:   fileID,
+		Name: strings.TrimSpace(stringValue(data["name"])),
+		Size: int64Value(data["size"]),
+	}
+	link, err := account.Link(ctx, file, model.LinkArgs{})
+	if err != nil {
+		return nil, err
+	}
+	return playbackLeaseResult(file, link), nil
+}
+
+func (d *GuangYaPanShare) cleanupPlayback(ctx context.Context, args model.OtherArgs) (interface{}, error) {
+	data := otherData(args.Data)
+	fileID := strings.TrimSpace(stringValue(data["file_id"]))
+	if fileID == "" {
+		return nil, errors.New("cleanup playback requires file_id")
+	}
+	cacheKey := playbackFileCacheKey(
+		strings.TrimSpace(stringValue(data["session_key"])),
+		d.AccountStorageID,
+	)
+	if cacheKey != "" {
+		defer guangYaPanPlaybackFiles.Delete(cacheKey)
+	}
+	account, err := d.account(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := &model.Object{
+		ID:   fileID,
+		Name: strings.TrimSpace(stringValue(data["name"])),
+		Size: int64Value(data["size"]),
+	}
+	removeErr := account.Remove(ctx, file)
+	if removeErr != nil {
+		return nil, removeErr
+	}
+	return map[string]interface{}{"removed": true}, nil
 }
 
 func (d *GuangYaPanShare) link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
@@ -281,7 +431,7 @@ func (d *GuangYaPanShare) link(ctx context.Context, file model.Obj, args model.L
 		return nil, err
 	}
 
-	go d.delete(ctx, restored, account)
+	go d.delete(context.Background(), restored, account)
 
 	return link, nil
 }
@@ -352,11 +502,12 @@ func (d *GuangYaPanShare) postShareAPI(ctx context.Context, apiPath string, body
 }
 
 func (d *GuangYaPanShare) restoreShare(ctx context.Context, account *guangyapan.GuangYaPan, fileID string) (string, error) {
-	body := map[string]any{
-		"accessToken": d.ShareAccessToken,
-		"fileIds":     []string{fileID},
-		"parentId":    strings.TrimSpace(account.TempDirId),
-	}
+	body := restoreShareBody(
+		d.ShareAccessToken,
+		fileID,
+		account.TempDirId,
+		account.ClientID,
+	)
 	var out restoreShareResp
 	if err := d.postAccountAPI(ctx, account, "/userres/v1/restore_share", body, &out); err != nil {
 		return "", err
@@ -381,6 +532,15 @@ func (d *GuangYaPanShare) restoreShare(ctx context.Context, account *guangyapan.
 		return "", errors.New("restore share failed: empty task id")
 	}
 	return strings.TrimSpace(out.Data.TaskID), nil
+}
+
+func restoreShareBody(accessToken, fileID, parentID, clientID string) map[string]any {
+	return map[string]any{
+		"accessToken": strings.TrimSpace(accessToken),
+		"fileIds":     []string{strings.TrimSpace(fileID)},
+		"parentId":    strings.TrimSpace(parentID),
+		"clientId":    strings.TrimSpace(clientID),
+	}
 }
 
 func (d *GuangYaPanShare) waitTaskDone(ctx context.Context, account *guangyapan.GuangYaPan, taskID string) error {
@@ -420,16 +580,16 @@ func (d *GuangYaPanShare) waitTaskDone(ctx context.Context, account *guangyapan.
 }
 
 func (d *GuangYaPanShare) resolveRestoredFile(ctx context.Context, account *guangyapan.GuangYaPan, taskID string, src model.Obj) (model.Obj, error) {
-	//if taskID != "" {
-	//	if fileID, err := d.getTaskFileID(ctx, account, taskID); err == nil && fileID != "" {
-	//		return &model.Object{
-	//			ID:       fileID,
-	//			Name:     src.GetName(),
-	//			Size:     src.GetSize(),
-	//			IsFolder: src.IsDir(),
-	//		}, nil
-	//	}
-	//}
+	if taskID != "" {
+		if fileID, err := d.getTaskFileID(ctx, account, taskID); err == nil && fileID != "" {
+			return &model.Object{
+				ID:       fileID,
+				Name:     src.GetName(),
+				Size:     src.GetSize(),
+				IsFolder: src.IsDir(),
+			}, nil
+		}
+	}
 
 	parentID := strings.TrimSpace(account.TempDirId)
 	files, err := account.List(ctx, &model.Object{ID: parentID, IsFolder: true}, model.ListArgs{})
@@ -506,8 +666,83 @@ func accountDeviceID(account *guangyapan.GuangYaPan, fallback string) string {
 	return randomDeviceID()
 }
 
-func shareLinkCacheKey(shareID, fileID string) string {
-	return strings.TrimSpace(shareID) + "|" + strings.TrimSpace(fileID)
+func shareLinkCacheKey(shareID, fileID string, accountStorageID uint) string {
+	return fmt.Sprintf(
+		"%s|%s|%d",
+		strings.TrimSpace(shareID),
+		strings.TrimSpace(fileID),
+		accountStorageID,
+	)
+}
+
+func playbackFileCacheKey(sessionKey string, accountStorageID uint) string {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" || accountStorageID == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s|%d", sessionKey, accountStorageID)
+}
+
+func playbackLeaseResult(file model.Obj, link *model.Link) map[string]interface{} {
+	if link == nil {
+		return map[string]interface{}{
+			"file_id": file.GetID(),
+			"name":    file.GetName(),
+			"size":    file.GetSize(),
+		}
+	}
+	expiresIn := int64(0)
+	if link.Expiration != nil {
+		expiresIn = int64(link.Expiration.Seconds())
+	}
+	return map[string]interface{}{
+		"file_id":    file.GetID(),
+		"name":       file.GetName(),
+		"size":       file.GetSize(),
+		"url":        link.URL,
+		"header":     link.Header,
+		"expires_in": expiresIn,
+	}
+}
+
+func otherData(value interface{}) map[string]interface{} {
+	if typed, ok := value.(map[string]interface{}); ok {
+		return typed
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return map[string]interface{}{}
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return map[string]interface{}{}
+	}
+	return result
+}
+
+func stringValue(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	return fmt.Sprint(value)
+}
+
+func int64Value(value interface{}) int64 {
+	switch typed := value.(type) {
+	case int64:
+		return typed
+	case int:
+		return int64(typed)
+	case float64:
+		return int64(typed)
+	case json.Number:
+		parsed, _ := typed.Int64()
+		return parsed
+	default:
+		var parsed int64
+		_, _ = fmt.Sscan(stringValue(value), &parsed)
+		return parsed
+	}
 }
 
 func findRestoredFile(files []model.Obj, target model.Obj) (model.Obj, bool) {
