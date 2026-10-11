@@ -291,7 +291,24 @@ func (d *BaiduShare2) List(ctx context.Context, dir model.Obj, args model.ListAr
 	return objs, err
 }
 
+func baiduPlaybackParamsError(shareID, shareUK, fid string) error {
+	if fid == "" {
+		return errors.New("[baidu_file_missing] 百度分享文件标识缺失")
+	}
+	if shareID == "" || shareUK == "" {
+		return fmt.Errorf("[baidu_share_incomplete] shareid=%v uk=%v fid=true", shareID != "", shareUK != "")
+	}
+	return nil
+}
+
 func (d *BaiduShare2) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	// MV owns the request-wide recovery budget. Browsing and unpinned mounts
+	// retain their initialization behavior; an incomplete playback cannot use a cache hit.
+	if d.AccountStorageID > 0 {
+		if err := baiduPlaybackParamsError(d.ShareId, d.ShareUk, file.GetID()); err != nil {
+			return nil, err
+		}
+	}
 	key := file.GetID()
 	if link, ok := baiduShareLinkCache.Get(key); ok {
 		return link, nil
@@ -322,6 +339,11 @@ func (d *BaiduShare2) link(ctx context.Context, file model.Obj, args model.LinkA
 // unlimitedLink 用给定百度账号解析一条“原画(无限)”免转存 dlna 直链。
 // sekey 用分享校验得到的 d.Token(即 BDCLND / randsk 的原始 URL-encoded 形态)。
 func (d *BaiduShare2) unlimitedLink(ctx context.Context, file model.Obj, bd *baidu_netdisk.BaiduNetdisk) (*model.Link, error) {
+	if d.AccountStorageID > 0 {
+		if err := baiduPlaybackParamsError(d.ShareId, d.ShareUk, file.GetID()); err != nil {
+			return nil, err
+		}
+	}
 	if d.ShareId == "" || d.ShareUk == "" {
 		if err := validateBaiduShare(d); err != nil {
 			return nil, err
@@ -353,6 +375,9 @@ func (d *BaiduShare2) unlimitedLink(ctx context.Context, file model.Obj, bd *bai
 }
 
 func (d *BaiduShare2) saveFile(fid string, bd *baidu_netdisk.BaiduNetdisk) (model.Obj, error) {
+	if err := baiduPlaybackParamsError(d.ShareId, d.ShareUk, fid); err != nil {
+		return nil, err
+	}
 	Cookie := cookie.SetStr(bd.Cookie, "BDCLND", d.Token)
 	decoded, err := decodeBaiduSekey(d.Token)
 	if err != nil {
@@ -391,6 +416,9 @@ func (d *BaiduShare2) saveFile(fid string, bd *baidu_netdisk.BaiduNetdisk) (mode
 		log.Debugf("response: %v", res.String())
 	}
 
+	if utils.Json.Get(res.Body(), "errno").ToInt() == -6 {
+		return nil, &baiduDlnaAPIError{errno: -6}
+	}
 	if utils.Json.Get(res.Body(), "errno").ToInt() != 0 {
 		return nil, errors.New(utils.Json.Get(res.Body(), "show_msg").ToString())
 	}

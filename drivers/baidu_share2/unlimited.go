@@ -69,6 +69,9 @@ type baiduDlnaAPIError struct {
 }
 
 func (e *baiduDlnaAPIError) Error() string {
+	if e.errno == -6 {
+		return "[baidu_login_invalid] 百度账号未登录: errno=-6"
+	}
 	if e.errno == -9 {
 		return "百度原画(无限)请求失败: errno=-9（文件不在当前分享校验上下文）"
 	}
@@ -207,7 +210,7 @@ func fetchBaiduAccountUID(ctx context.Context, client baiduHTTPDoer, accountCook
 	}
 	match := baiduUIDPattern.FindSubmatch(body)
 	if len(match) < 2 {
-		return "", errors.New("百度原画(无限)未能解析 uid，请检查 Cookie")
+		return "", errors.New("百度原画(无限)未能解析账号 UID")
 	}
 	return string(match[1]), nil
 }
@@ -295,17 +298,13 @@ func followBaiduDlnaRedirect(ctx context.Context, client baiduHTTPDoer, rawURL s
 // model.Link(仅带 dlna UA，免 Cookie、Range 支持)。任一环节失败即返回 error，
 // 由驱动层回退到 saveFile 转存-删除方案。
 func resolveBaiduUnlimitedLink(ctx context.Context, client baiduHTTPDoer, params baiduUnlimitedParams) (*model.Link, error) {
+	if err := baiduPlaybackParamsError(params.shareID, params.shareUK, params.fileID); err != nil {
+		return nil, err
+	}
 	bduss := cookie.GetStr(params.cookie, "BDUSS")
 	if bduss == "" {
 		return nil, errors.New("百度账号 Cookie 缺少 BDUSS")
 	}
-	if params.shareID == "" || params.shareUK == "" || params.fileID == "" {
-		return nil, fmt.Errorf(
-			"百度原画(无限)参数不完整: shareid=%v uk=%v fid=%v",
-			params.shareID != "", params.shareUK != "", params.fileID != "",
-		)
-	}
-
 	uid, err := fetchBaiduAccountUID(ctx, client, params.cookie)
 	if err != nil {
 		return nil, err
