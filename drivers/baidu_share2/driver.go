@@ -190,7 +190,7 @@ func (d *BaiduShare2) getInfo() error {
 		d.Token = BDCLND.Value
 	}
 
-	re := regexp.MustCompile(`shareid:\s*"(\d+)"`)
+	re := regexp.MustCompile(`shareid"?\s*[:=]\s*"?(\d+)`)
 	matches := re.FindStringSubmatch(res.String())
 	if len(matches) >= 2 {
 		d.ShareId = matches[1]
@@ -199,7 +199,7 @@ func (d *BaiduShare2) getInfo() error {
 		log.Warn("Share ID not found")
 	}
 
-	re = regexp.MustCompile(`share_uk:\s*"(\d+)"`)
+	re = regexp.MustCompile(`share_uk"?\s*[:=]\s*"?(\d+)`)
 	matches = re.FindStringSubmatch(res.String())
 	if len(matches) >= 2 {
 		d.ShareUk = matches[1]
@@ -268,6 +268,13 @@ func (d *BaiduShare2) List(ctx context.Context, dir model.Obj, args model.ListAr
 		if err == nil {
 			if res.IsSuccess() && respJson.Errno == 0 {
 				page++
+				// The share page may be a JS shell; the listing also carries these IDs.
+				if d.ShareId == "" {
+					d.ShareId = utils.Json.Get(res.Body(), "share_id").ToString()
+				}
+				if d.ShareUk == "" {
+					d.ShareUk = utils.Json.Get(res.Body(), "uk").ToString()
+				}
 				for _, v := range respJson.List {
 					size, _ := v.Size.Int64()
 					mtime, _ := v.Mtime.Int64()
