@@ -393,11 +393,9 @@ func (d *Pan115) UploadByMultipart(ctx context.Context, params *driver115.Upload
 			for chunk := range chunksCh {
 				var part oss.UploadPart // 出现错误就继续尝试，共尝试3次
 				for retry := 0; retry < 3; retry++ {
-					if utils.IsCanceled(ctx) {
-						err = ctx.Err()
-						break
-					}
 					select {
+					case <-ctx.Done():
+						break
 					case <-ticker.C:
 						if ossToken, err = d.client.GetOSSToken(); err != nil { // 到时重新获取ossToken
 							errCh <- errors.Wrap(err, "刷新token时出现错误")

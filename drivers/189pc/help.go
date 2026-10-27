@@ -9,7 +9,6 @@ import (
 	"crypto/sha1"
 	"crypto/x509"
 	"encoding/hex"
-	"encoding/json"
 	"encoding/pem"
 	"encoding/xml"
 	"fmt"
@@ -20,7 +19,6 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils/random"
 )
 
@@ -103,13 +101,7 @@ func MustParseTime(str string) *time.Time {
 
 type Time time.Time
 
-func (t *Time) UnmarshalJSON(b []byte) error {
-	var s string
-	if err := json.Unmarshal(b, &s); err != nil {
-		return err
-	}
-	return t.Unmarshal([]byte(s))
-}
+func (t *Time) UnmarshalJSON(b []byte) error { return t.Unmarshal(b) }
 func (t *Time) UnmarshalXML(e *xml.Decoder, ee xml.StartElement) error {
 	b, err := e.Token()
 	if err != nil {
@@ -124,19 +116,10 @@ func (t *Time) UnmarshalXML(e *xml.Decoder, ee xml.StartElement) error {
 }
 func (t *Time) Unmarshal(b []byte) error {
 	bs := strings.Trim(string(b), "\"")
-	// Normalize non-breaking spaces used before AM/PM in newer responses.
-	bs = strings.ReplaceAll(bs, "\u202f", " ")
-	bs = strings.ReplaceAll(bs, "\u00a0", " ")
 	var v time.Time
 	var err error
-	// Keep explicit timezones; use China time when no timezone was supplied.
-	for _, s := range []string{bs, bs + " +08"} {
-		for _, f := range []string{"2006-01-02 15:04:05 -07", "Jan 2, 2006 3:04:05 PM -07", "Jan 2, 2006, 3:04:05 PM -07"} {
-			v, err = time.ParseInLocation(f, s, utils.CNLoc)
-			if err == nil {
-				break
-			}
-		}
+	for _, f := range []string{"2006-01-02 15:04:05 -07", "Jan 2, 2006 15:04:05 PM -07"} {
+		v, err = time.ParseInLocation(f, bs+" +08", time.Local)
 		if err == nil {
 			break
 		}
